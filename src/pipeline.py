@@ -260,6 +260,101 @@ plt.savefig(f"{OUT}/confusion_matrix.png", dpi=150); plt.close()
 
 record("classification_report", classification_report(true_bucket, pred_bucket, labels=labels_order, zero_division=0))
 
+# ===========================================================================
+# ARCHITECTURE COMPARISON
+# Architecture A (above) = ONE hybrid regressor; category is DERIVED from its
+# numeric AQI prediction via fixed CPCB thresholds. No model ever sees the
+# category labels during training.
+# Architecture B (below) = TWO separate hybrids: the same regression hybrid
+# above, PLUS an independent classification hybrid (RF/XGB/ExtraTrees
+# CLASSIFIERS) trained DIRECTLY on the true AQI_Bucket labels.
+# ===========================================================================
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import log_loss
+from xgboost import XGBClassifier
+
+le = LabelEncoder()
+le.fit(y_bucket)  # fit on the full label set so all 6 classes are known
+bucket_train_enc = le.transform(bucket_train)
+bucket_val_enc = le.transform(bucket_val)
+bucket_test_enc = le.transform(bucket_test)
+n_classes = len(le.classes_)
+
+rf_clf = RandomForestClassifier(n_estimators=150, max_depth=18, n_jobs=-1, random_state=RNG, class_weight="balanced")
+xgb_clf = XGBClassifier(n_estimators=200, learning_rate=0.08, max_depth=6, subsample=0.8,
+                         colsample_bytree=0.8, n_jobs=-1, random_state=RNG,
+                         objective="multi:softprob", num_class=n_classes, eval_metric="mlogloss")
+et_clf = ExtraTreesClassifier(n_estimators=150, max_depth=18, n_jobs=-1, random_state=RNG, class_weight="balanced")
+
+clf_base_models = {"RandomForest_clf": rf_clf, "XGBoost_clf": xgb_clf, "ExtraTrees_clf": et_clf}
+val_proba, test_proba = {}, {}
+for name, model in clf_base_models.items():
+    model.fit(X_train, bucket_train_enc)
+    val_proba[name] = model.predict_proba(X_val)
+    test_proba[name] = model.predict_proba(X_test)
+    acc = accuracy_score(bucket_test_enc, model.predict(X_test))
+    record(f"individual_classifier_accuracy_{name}", round(acc, 4))
+
+# --- Hybrid B1: validation-weighted probability averaging -----------------
+def mlogloss_of_weights(w):
+    w = np.abs(w) / np.sum(np.abs(w))
+    blended = sum(w_i * val_proba[n] for w_i, n in zip(w, clf_base_models))
+    return log_loss(bucket_val_enc, blended, labels=list(range(n_classes)))
+
+res_c = minimize(mlogloss_of_weights, x0=np.array([1/3, 1/3, 1/3]), method="Nelder-Mead")
+cls_weights = np.abs(res_c.x) / np.sum(np.abs(res_c.x))
+cls_weights_dict = {n: round(float(w), 4) for n, w in zip(clf_base_models, cls_weights)}
+record("classification_weighted_hybrid_weights (validation-optimised)", cls_weights_dict)
+
+test_blend_proba = sum(w_i * test_proba[n] for w_i, n in zip(cls_weights, clf_base_models))
+weighted_cls_pred = le.inverse_transform(test_blend_proba.argmax(axis=1))
+
+# --- Hybrid B2: stacking (meta-learner on concatenated class probabilities)
+V_cls = np.hstack([val_proba[n] for n in clf_base_models])
+T_cls = np.hstack([test_proba[n] for n in clf_base_models])
+meta_clf = LogisticRegression(max_iter=2000)
+meta_clf.fit(V_cls, bucket_val_enc)
+stacking_cls_pred = le.inverse_transform(meta_clf.predict(T_cls))
+
+def cls_metrics(y_true, y_pred):
+    return {
+        "Accuracy": round(accuracy_score(y_true, y_pred), 4),
+        "Precision_macro": round(precision_score(y_true, y_pred, average="macro", zero_division=0), 4),
+        "Recall_macro": round(recall_score(y_true, y_pred, average="macro", zero_division=0), 4),
+        "F1_macro": round(f1_score(y_true, y_pred, average="macro", zero_division=0), 4),
+    }
+
+arch_b_results = {
+    "DirectHybrid_WeightedProba": cls_metrics(true_bucket, weighted_cls_pred),
+    "DirectHybrid_Stacking": cls_metrics(true_bucket, stacking_cls_pred),
+}
+record("architecture_B_direct_classification_results (test set)", arch_b_results)
+
+best_arch_b_name = "DirectHybrid_Stacking" if arch_b_results["DirectHybrid_Stacking"]["F1_macro"] >= arch_b_results["DirectHybrid_WeightedProba"]["F1_macro"] else "DirectHybrid_WeightedProba"
+best_arch_b_pred = stacking_cls_pred if best_arch_b_name == "DirectHybrid_Stacking" else weighted_cls_pred
+record("selected_architecture_B_configuration", best_arch_b_name)
+
+# --- Architecture A vs Architecture B, head to head -------------------------
+architecture_comparison = {
+    "Architecture_A_DerivedFromRegression": cls_metrics,
+    "Architecture_A_metrics": cls_metrics(true_bucket, pred_bucket),
+    "Architecture_B_metrics": cls_metrics(true_bucket, best_arch_b_pred),
+}
+del architecture_comparison["Architecture_A_DerivedFromRegression"]  # remove the function reference accidentally captured
+record("ARCHITECTURE_A_vs_B_final_comparison (test set)", architecture_comparison)
+
+cm_b = confusion_matrix(true_bucket, best_arch_b_pred, labels=labels_order)
+plt.figure(figsize=(7, 6))
+sns.heatmap(cm_b, annot=True, fmt="d", cmap="Greens", xticklabels=labels_order, yticklabels=labels_order)
+plt.xlabel("Predicted category"); plt.ylabel("True category")
+plt.title("Confusion Matrix — Architecture B (direct classification hybrid)")
+plt.tight_layout()
+plt.savefig(f"{OUT}/confusion_matrix_architecture_B.png", dpi=150); plt.close()
+
+record("architecture_B_classification_report", classification_report(true_bucket, best_arch_b_pred, labels=labels_order, zero_division=0))
+
 # ---------------------------------------------------------------------------
 # 10. SHAP EXPLAINABILITY (on the strongest single tree model — XGBoost)
 # ---------------------------------------------------------------------------
@@ -306,8 +401,12 @@ joblib.dump(xgb, f"{OUT}/model_xgboost.joblib")
 joblib.dump(et, f"{OUT}/model_extra_trees.joblib")
 joblib.dump(meta_learner, f"{OUT}/model_hybrid_stacking_meta.joblib")
 joblib.dump({"weights": weights_dict, "feature_columns": list(X.columns)}, f"{OUT}/hybrid_weighted_config.joblib")
+joblib.dump(xgb_clf, f"{OUT}/model_xgboost_classifier.joblib")
+joblib.dump(meta_clf, f"{OUT}/model_architectureB_stacking_meta.joblib")
+joblib.dump(le, f"{OUT}/label_encoder.joblib")
 
 pd.DataFrame(results).T.to_csv(f"{OUT}/regression_results.csv")
+pd.DataFrame(architecture_comparison).T.to_csv(f"{OUT}/architecture_A_vs_B_results.csv")
 
 with open(f"{OUT}/full_run_log.json", "w") as f:
     json.dump(log, f, indent=2, default=str)
