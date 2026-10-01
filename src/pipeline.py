@@ -33,7 +33,9 @@ warnings.filterwarnings("ignore")
 RNG = 42
 np.random.seed(RNG)
 
-BASE = "/home/claude/aqi_project"
+# Portable path resolution — works on Windows, Mac, Linux.
+# BASE resolves to the repo root (parent of this file's folder).
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = f"{BASE}/outputs"
 os.makedirs(OUT, exist_ok=True)
 
@@ -318,7 +320,7 @@ meta_clf = LogisticRegression(max_iter=2000)
 meta_clf.fit(V_cls, bucket_val_enc)
 stacking_cls_pred = le.inverse_transform(meta_clf.predict(T_cls))
 
-def cls_metrics(y_true, y_pred):
+def cls_metrics_fn(y_true, y_pred):
     return {
         "Accuracy": round(accuracy_score(y_true, y_pred), 4),
         "Precision_macro": round(precision_score(y_true, y_pred, average="macro", zero_division=0), 4),
@@ -327,8 +329,8 @@ def cls_metrics(y_true, y_pred):
     }
 
 arch_b_results = {
-    "DirectHybrid_WeightedProba": cls_metrics(true_bucket, weighted_cls_pred),
-    "DirectHybrid_Stacking": cls_metrics(true_bucket, stacking_cls_pred),
+    "DirectHybrid_WeightedProba": cls_metrics_fn(true_bucket, weighted_cls_pred),
+    "DirectHybrid_Stacking": cls_metrics_fn(true_bucket, stacking_cls_pred),
 }
 record("architecture_B_direct_classification_results (test set)", arch_b_results)
 
@@ -338,11 +340,9 @@ record("selected_architecture_B_configuration", best_arch_b_name)
 
 # --- Architecture A vs Architecture B, head to head -------------------------
 architecture_comparison = {
-    "Architecture_A_DerivedFromRegression": cls_metrics,
-    "Architecture_A_metrics": cls_metrics(true_bucket, pred_bucket),
-    "Architecture_B_metrics": cls_metrics(true_bucket, best_arch_b_pred),
+    "Architecture_A_metrics": cls_metrics_fn(true_bucket, pred_bucket),
+    "Architecture_B_metrics": cls_metrics_fn(true_bucket, best_arch_b_pred),
 }
-del architecture_comparison["Architecture_A_DerivedFromRegression"]  # remove the function reference accidentally captured
 record("ARCHITECTURE_A_vs_B_final_comparison (test set)", architecture_comparison)
 
 cm_b = confusion_matrix(true_bucket, best_arch_b_pred, labels=labels_order)
@@ -404,6 +404,10 @@ joblib.dump({"weights": weights_dict, "feature_columns": list(X.columns)}, f"{OU
 joblib.dump(xgb_clf, f"{OUT}/model_xgboost_classifier.joblib")
 joblib.dump(meta_clf, f"{OUT}/model_architectureB_stacking_meta.joblib")
 joblib.dump(le, f"{OUT}/label_encoder.joblib")
+
+# --- ADDED: save RF and ET classifiers so the Gradio app can load all three ---
+joblib.dump(rf_clf, f"{OUT}/model_random_forest_classifier.joblib")
+joblib.dump(et_clf, f"{OUT}/model_extra_trees_classifier.joblib")
 
 pd.DataFrame(results).T.to_csv(f"{OUT}/regression_results.csv")
 pd.DataFrame(architecture_comparison).T.to_csv(f"{OUT}/architecture_A_vs_B_results.csv")
